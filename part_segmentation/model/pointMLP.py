@@ -126,17 +126,94 @@ def knn_point(nsample, xyz, new_xyz):
     return group_idx
 
 
+def distance_interpolate(point_xyz1, point_xyz2, point_feat1, point_feat2):
+    """
+    Input:
+        point_xyz1: input points position data, [B, N, 3]
+        point_xyz2: sampled input points position data, [B, S, 3]
+        point_feat1: input points data, [B, D', N]
+        point_feat2: input points data, [B, D'', S]
+    Return:
+        new_point_feat: upsampled points data, [B, D''', N]
+    """
+    # 
+    B, N, C = point_xyz1.shape  # [batch, point, 3]
+    _, S, _ = point_xyz2.shape  # [batch, sample, 3]
+
+    # 
+    point_feat2 = point_feat2.permute(0, 2, 1)  # [batch, sample, en_dim]
+    if S == 1:
+        interpolated_feat = point_feat2.repeat(1, N, 1)
+    else:
+        dists = square_distance(point_xyz1, point_xyz2)
+        dists, idx = dists.sort(dim=-1)
+        dists, idx = dists[:, :, :3], idx[:, :, :3]  # [B, N, 3]
+
+        dist_recip = 1.0 / (dists + 1e-8)
+        norm = torch.sum(dist_recip, dim=2, keepdim=True)
+        weight = dist_recip / norm
+        interpolated_feat = torch.sum(index_points(point_feat2, idx) * weight.view(B, N, 3, 1), dim=2)
+
+    # 
+    if point_feat1 is not None:
+        point_feat1 = point_feat1.permute(0, 2, 1)  # [batch, point, de_dim]
+        new_point_feat = torch.cat([point_feat1, interpolated_feat], dim=-1)
+    else:
+        new_point_feat = interpolated_feat
+
+    return new_point_feat
+
+
+class ConvBNReLU1D(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=1, bias=True, activation='relu'):
+        super(ConvBNReLU1D, self).__init__()
+        self.act = get_activation(activation)
+        self.net = nn.Sequential(
+            nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, bias=bias),
+            nn.BatchNorm1d(out_channels),
+            self.act
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class ConvBNReLURes1D(nn.Module):
+    def __init__(self, channels, kernel_size=1, groups=1, res_expansion=1.0, bias=True, activation='relu'):
+        super(ConvBNReLURes1D, self).__init__()
+        self.act = get_activation(activation)
+        self.net1 = nn.Sequential(
+            nn.Conv1d(in_channels=channels, out_channels=int(channels * res_expansion),
+                      kernel_size=kernel_size, groups=groups, bias=bias),
+            nn.BatchNorm1d(int(channels * res_expansion)),
+            self.act
+        )
+        if groups > 1:
+            self.net2 = nn.Sequential(
+                nn.Conv1d(in_channels=int(channels * res_expansion), out_channels=channels,
+                          kernel_size=kernel_size, groups=groups, bias=bias),
+                nn.BatchNorm1d(channels),
+                self.act,
+                nn.Conv1d(in_channels=channels, out_channels=channels,
+                          kernel_size=kernel_size, bias=bias),
+                nn.BatchNorm1d(channels),
+            )
+        else:
+            self.net2 = nn.Sequential(
+                nn.Conv1d(in_channels=int(channels * res_expansion), out_channels=channels,
+                          kernel_size=kernel_size, bias=bias),
+                nn.BatchNorm1d(channels)
+            )
+
+    def forward(self, x):
+        return self.act(self.net2(self.net1(x)) + x)
+
+
 class LocalGrouper(nn.Module):
-    def __init__(self, channel, sample_num, k_neighbors, use_xyz=True, normalize="anchor", **kwargs):
-        """
-        Give xyz[b,p,3] and fea[b,p,d], return sampled_xyz[b,g,3] and new_fea[b,g,k,d]
-        :param sample_num: sampled point number
-        :param k_neighbors: k-nerighbors
-        :param kwargs: others
-        """
-        super(LocalGrouper, self).__init__()
+    def __init__(self, channels, sample_num, neighbor_num, use_xyz=True, normalize="anchor", **kwargs):
+        super().__init__()
         self.sample_num = sample_num
-        self.k_neighbors = k_neighbors
+        self.neighbor_num = neighbor_num
         self.use_xyz = use_xyz
         if normalize is not None:
             self.normalize = normalize.lower()
@@ -147,8 +224,8 @@ class LocalGrouper(nn.Module):
             self.normalize = None
         if self.normalize is not None:
             add_channel = 3 if self.use_xyz else 0
-            self.affine_alpha = nn.Parameter(torch.ones([1, 1, 1, channel + add_channel]))
-            self.affine_beta = nn.Parameter(torch.zeros([1, 1, 1, channel + add_channel]))
+            self.affine_alpha = nn.Parameter(torch.ones([1, 1, 1, channels + add_channel]))
+            self.affine_beta = nn.Parameter(torch.zeros([1, 1, 1, channels + add_channel]))
 
     def forward(self, point_xyz, point_feat):
         """
@@ -167,7 +244,7 @@ class LocalGrouper(nn.Module):
         sampled_feat = index_points(point_feat, fps_idx)  # [batch, sample, dim]
 
         # Search and group neighbor points around sample points
-        idx = knn_point(self.k_neighbors, point_xyz, sampled_xyz)  # [batch, sample, neighbor]
+        idx = knn_point(self.neighbor_num, point_xyz, sampled_xyz)  # [batch, sample, neighbor]
         # idx = query_ball_point(radius, nsample, point_xyz, sampled_xyz)
         grouped_xyz = index_points(point_xyz, idx)  # [batch, sample, neighbor, 3]
         grouped_feat = index_points(point_feat, idx)  # [batch, sample, neighbor, dim]
@@ -188,66 +265,49 @@ class LocalGrouper(nn.Module):
             grouped_feat = self.affine_alpha * grouped_feat + self.affine_beta
 
         # Unsqueeze sampled features and concatenate behind grouped features
-        sampled_feat = sampled_feat.view(B, S, 1, -1).repeat(1, 1, self.k_neighbors, 1)  # [batch, sample, neighbor, dim]
-        sampled_feat = torch.cat([grouped_feat, sampled_feat], dim=-1)  # [batch, sample, neighbor, dim * 2 (+ 3)]
+        sampled_feat = sampled_feat.view(B, S, 1, -1).repeat(1, 1, self.neighbor_num, 1)  # [batch, sample, neighbor, dim]
+        sampled_feat = torch.cat([grouped_feat, sampled_feat], dim=-1)  # [batch, sample, neighbor, 2 * dim (+ 3)]
         return sampled_xyz, sampled_feat
 
 
-class ConvBNReLU1D(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=1, bias=True, activation='relu'):
-        super(ConvBNReLU1D, self).__init__()
-        self.act = get_activation(activation)
-        self.net = nn.Sequential(
-            nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, bias=bias),
-            nn.BatchNorm1d(out_channels),
-            self.act
-        )
+class DistInterpolator(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
 
-    def forward(self, x):
-        return self.net(x)
+    def forward(self, point_xyz1, point_xyz2, point_feat1, point_feat2):
+        # 
+        B, N, C = point_xyz1.shape  # [batch, point, 3]
+        _, S, _ = point_xyz2.shape  # [batch, sample, 3]
 
-
-class ConvBNReLURes1D(nn.Module):
-    def __init__(self, channel, kernel_size=1, groups=1, res_expansion=1.0, bias=True, activation='relu'):
-        super(ConvBNReLURes1D, self).__init__()
-        self.act = get_activation(activation)
-        self.net1 = nn.Sequential(
-            nn.Conv1d(in_channels=channel, out_channels=int(channel * res_expansion),
-                      kernel_size=kernel_size, groups=groups, bias=bias),
-            nn.BatchNorm1d(int(channel * res_expansion)),
-            self.act
-        )
-        if groups > 1:
-            self.net2 = nn.Sequential(
-                nn.Conv1d(in_channels=int(channel * res_expansion), out_channels=channel,
-                          kernel_size=kernel_size, groups=groups, bias=bias),
-                nn.BatchNorm1d(channel),
-                self.act,
-                nn.Conv1d(in_channels=channel, out_channels=channel,
-                          kernel_size=kernel_size, bias=bias),
-                nn.BatchNorm1d(channel),
-            )
+        # 
+        point_feat2 = point_feat2.permute(0, 2, 1)  # [batch, sample, en_dim]
+        if S == 1:
+            interpolated_feat = point_feat2.repeat(1, N, 1)
         else:
-            self.net2 = nn.Sequential(
-                nn.Conv1d(in_channels=int(channel * res_expansion), out_channels=channel,
-                          kernel_size=kernel_size, bias=bias),
-                nn.BatchNorm1d(channel)
-            )
+            dists = square_distance(point_xyz1, point_xyz2)
+            dists, idx = dists.sort(dim=-1)
+            dists, idx = dists[:, :, :3], idx[:, :, :3]  # [B, N, 3]
 
-    def forward(self, x):
-        return self.act(self.net2(self.net1(x)) + x)
+            dist_recip = 1.0 / (dists + 1e-8)
+            norm = torch.sum(dist_recip, dim=2, keepdim=True)
+            weight = dist_recip / norm
+            interpolated_feat = torch.sum(index_points(point_feat2, idx) * weight.view(B, N, 3, 1), dim=2)
+
+        # 
+        if point_feat1 is not None:
+            point_feat1 = point_feat1.permute(0, 2, 1)  # [batch, point, de_dim]
+            new_point_feat = torch.cat([point_feat1, interpolated_feat], dim=-1)
+        else:
+            new_point_feat = interpolated_feat
+        
+        return new_point_feat
 
 
 class PreExtraction(nn.Module):
-    def __init__(self, channels, out_channels, blocks=1, groups=1, res_expansion=1, bias=True,
+    def __init__(self, in_channels, out_channels, blocks=1, groups=1, res_expansion=1, bias=True,
                  activation='relu', use_xyz=True):
-        """
-        input: [b,g,k,d]: output:[b,d,g]
-        :param channels:
-        :param blocks:
-        """
-        super(PreExtraction, self).__init__()
-        in_channels = 2 * channels + 3 if use_xyz else 2 * channels
+        super().__init__()
+        in_channels = 2 * in_channels + 3 if use_xyz else 2 * in_channels
         self.transfer = ConvBNReLU1D(in_channels, out_channels, bias=bias, activation=activation)
         operation = []
         for _ in range(blocks):
@@ -258,9 +318,12 @@ class PreExtraction(nn.Module):
         self.operation = nn.Sequential(*operation)
 
     def forward(self, x):
-        b, s, n, d = x.size()  # [batch, sample, neighbor, dim]
-        x = x.permute(0, 1, 3, 2)  # [batch, sample, dim, neighbor]
-        x = x.reshape(-1, d, n)  # [batch * sample, dim, neighbor]
+        """
+        :param x: [batch, sample, neighbor, 2 * dim (+ 3)]
+        """
+        b, s, n, d = x.size()  # [batch, sample, neighbor, 2 * dim (+ 3)]
+        x = x.permute(0, 1, 3, 2)  # [batch, sample, 2 * dim (+ 3), neighbor]
+        x = x.reshape(-1, d, n)  # [batch * sample, 2 * dim (+ 3), neighbor]
 
         # Embed and enlarge dims
         x = self.transfer(x)  # [batch * sample, dim, neighbor]
@@ -281,13 +344,8 @@ class PreExtraction(nn.Module):
 
 
 class PosExtraction(nn.Module):
-    def __init__(self, channels, blocks=1, groups=1, res_expansion=1, bias=True, activation='relu'):
-        """
-        input[b,d,g]; output[b,d,g]
-        :param channels:
-        :param blocks:
-        """
-        super(PosExtraction, self).__init__()
+    def __init__(self, channels, blocks=1, groups=1, res_expansion=1, bias=True, activation='relu', use_xyz=True):
+        super().__init__()
         operation = []
         for _ in range(blocks):
             operation.append(
@@ -296,14 +354,50 @@ class PosExtraction(nn.Module):
         self.operation = nn.Sequential(*operation)
 
     def forward(self, x):
+        """
+        :param x: [batch, dim, sample]
+        """
         return self.operation(x)  # [batch, dim, sample]
+    
+
+class Encoder(nn.Module):
+    def __init__(self, in_channels, out_channels, sample_num, neighbor_num, use_xyz=True, normalize="anchor",
+                 blocks=1, groups=1, res_expansion=1, bias=True, activation='relu'):
+        super().__init__()
+        
+        # 
+        self.local_grouper = LocalGrouper(in_channels, sample_num=sample_num, neighbor_num=neighbor_num, 
+                                          use_xyz=use_xyz, normalize=normalize)
+
+        #
+        self.pre_extractor = PreExtraction(in_channels, out_channels, blocks=blocks, groups=groups, use_xyz=use_xyz,
+                                           res_expansion=res_expansion, bias=bias, activation=activation)
+        
+        #
+        self.pos_extractor = PosExtraction(out_channels, blocks=blocks, groups=groups, use_xyz=use_xyz,
+                                           res_expansion=res_expansion, bias=bias, activation=activation)
+
+    def forward(self, point_xyz, x):
+        # input:  point_xyz[batch, point, 3],  x[batch, point, in_dim]
+        # output: point_xyz[batch, sample, 3], x[batch, sample, neighbor, 2 * in_dim (+ 3)]
+        point_xyz, x = self.local_grouper(point_xyz, x.permute(0, 2, 1))
+
+        # input:  x[batch, sample, neighbor, 2 * in_dim (+ 3)]
+        # output: x[batch, out_dim, sample]
+        x = self.pre_extractor(x)
+
+        # input:  feat[batch, out_dim, sample]
+        # output: feat[batch, out_dim, sample]
+        x = self.pos_extractor(x)
+
+        return point_xyz, x
 
 
-class PointNetFeaturePropagation(nn.Module):
-    def __init__(self, in_channel, out_channel, blocks=1, groups=1, res_expansion=1.0, bias=True, activation='relu'):
-        super(PointNetFeaturePropagation, self).__init__()
-        self.fuse = ConvBNReLU1D(in_channel, out_channel, 1, bias=bias)
-        self.extraction = PosExtraction(out_channel, blocks, groups=groups,
+class Decoder(nn.Module):
+    def __init__(self, in_channels, out_channels, blocks=1, groups=1, res_expansion=1.0, bias=True, activation='relu'):
+        super().__init__()
+        self.fuse = ConvBNReLU1D(in_channels, out_channels, 1, bias=bias)
+        self.extraction = PosExtraction(out_channels, blocks, groups=groups,
                                         res_expansion=res_expansion, bias=bias, activation=activation)
 
     def forward(self, point_xyz1, point_xyz2, point_feat1, point_feat2):
@@ -316,118 +410,85 @@ class PointNetFeaturePropagation(nn.Module):
         Return:
             new_point_feat: upsampled points data, [B, D''', N]
         """
-        # 
-        B, N, C = point_xyz1.shape  # [batch, point, 3]
-        _, S, _ = point_xyz2.shape  # [batch, sample, 3]
+        new_point_feat = distance_interpolate(point_xyz1, point_xyz2, point_feat1, point_feat2)
 
-        # 
-        point_feat2 = point_feat2.permute(0, 2, 1)  # [batch, sample, en_dim]
-        if S == 1:
-            interpolated_points = point_feat2.repeat(1, N, 1)
-        else:
-            dists = square_distance(point_xyz1, point_xyz2)
-            dists, idx = dists.sort(dim=-1)
-            dists, idx = dists[:, :, :3], idx[:, :, :3]  # [B, N, 3]
-
-            dist_recip = 1.0 / (dists + 1e-8)
-            norm = torch.sum(dist_recip, dim=2, keepdim=True)
-            weight = dist_recip / norm
-            interpolated_points = torch.sum(index_points(point_feat2, idx) * weight.view(B, N, 3, 1), dim=2)
-
-        # 
-        if point_feat1 is not None:
-            point_feat1 = point_feat1.permute(0, 2, 1)  # [batch, point, de_dim]
-            new_point_feat = torch.cat([point_feat1, interpolated_points], dim=-1)
-        else:
-            new_point_feat = interpolated_points
-
-        new_point_feat = new_point_feat.permute(0, 2, 1)  # [batch, en_dim + de_dim, point]
+        new_point_feat = new_point_feat.permute(0, 2, 1)  # [batch, de_dim + en_dim, point]
         new_point_feat = self.fuse(new_point_feat)
         new_point_feat = self.extraction(new_point_feat)  # [batch, de_dim, point]
         return new_point_feat
 
 
 class PointMLP(nn.Module):
-    def __init__(self, num_classes=50, points=2048, embed_dim=64, groups=1, res_expansion=1.0,
-                 activation="relu", bias=True, use_xyz=True, normalize="anchor",
-                 dim_expansion=[2, 2, 2, 2], pre_blocks=[2, 2, 2, 2], pos_blocks=[2, 2, 2, 2],
-                 k_neighbors=[32, 32, 32, 32], reducers=[4, 4, 4, 4],
-                 de_dims=[512, 256, 128, 128], de_blocks=[2, 2, 2, 2],
+    def __init__(self, class_num=50, point_num=2048, embed_dim=64, groups=1, res_expansion=1.0,
+                 activation="relu", bias=True, use_xyz=True, normalize="anchor", pre_blocks=[2, 2, 2, 2], pos_blocks=[2, 2, 2, 2],
+                 sample_nums=[512, 128, 32, 8], neighbor_nums=[32, 32, 32, 32],
+                 en_dims=[128, 256, 512, 1024], de_dims=[512, 256, 128, 128], de_blocks=[4, 4, 4, 4],
                  gmp_dim=64, cls_dim=64, **kwargs):
         super(PointMLP, self).__init__()
-        self.stages = len(pre_blocks)
-        self.class_num = num_classes
-        self.points = points
+        # Check arguments
+        assert len(pre_blocks) == len(pos_blocks) == len(neighbor_nums), \
+            "Please check stage number consistent for pre_blocks, pos_blocks neighbor_nums, reducers."
+        assert len(en_dims) == len(de_dims) == len(de_blocks), \
+            "Please check stage number consistent for en_dims, de_dims, en_blocks, de_blocks"
+
+        # Embedding features
         self.embedding = ConvBNReLU1D(6, embed_dim, bias=bias, activation=activation)
-        assert len(pre_blocks) == len(k_neighbors) == len(reducers) == len(pos_blocks) == len(dim_expansion), \
-            "Please check stage number consistent for pre_blocks, pos_blocks k_neighbors, reducers."
-        self.local_grouper_list = nn.ModuleList()
-        self.pre_blocks_list = nn.ModuleList()
-        self.pos_blocks_list = nn.ModuleList()
+
+        # Initialize basic info
         last_channel = embed_dim
-        anchor_points = self.points
-        en_dims = [last_channel]
 
         # Building Encoder
+        en_dims.insert(0, embed_dim)
+        self.encoder_list = nn.ModuleList()
         for i in range(len(pre_blocks)):
-            out_channel = last_channel * dim_expansion[i]
-            pre_block_num = pre_blocks[i]
-            pos_block_num = pos_blocks[i]
-            k_neighbor = k_neighbors[i]
-            reduce = reducers[i]
-            anchor_points = anchor_points // reduce
-            
-            # append local_grouper_list
-            local_grouper = LocalGrouper(last_channel, anchor_points, k_neighbor, use_xyz, normalize)  # [b,g,k,d]
-            self.local_grouper_list.append(local_grouper)
-            
-            # append pre_block_list
-            pre_block_module = PreExtraction(last_channel, out_channel, pre_block_num, groups=groups,
-                                             res_expansion=res_expansion,
-                                             bias=bias, activation=activation, use_xyz=use_xyz)  # 2 * last_channel
-            self.pre_blocks_list.append(pre_block_module)
-            
-            # append pos_block_list
-            pos_block_module = PosExtraction(out_channel, pos_block_num, groups=groups,
-                                             res_expansion=res_expansion, bias=bias, activation=activation)
-            self.pos_blocks_list.append(pos_block_module)
+            out_channel = en_dims[i + 1]
+
+            # TODO LocalGrouper outside?
+            self.encoder_list.append(
+                Encoder(last_channel, out_channel, sample_num=sample_nums[i], neighbor_num=neighbor_nums[i], 
+                        use_xyz=use_xyz, normalize=normalize, blocks=pre_blocks[i], groups=groups,
+                        res_expansion=res_expansion, bias=bias, activation=activation)
+            )
 
             last_channel = out_channel
-            en_dims.append(last_channel)
 
         # Reverse
         en_dims.reverse()
 
         # Building Decoder
-        self.decode_list = nn.ModuleList()
-        de_dims.insert(0,en_dims[0])
-        assert len(en_dims) ==len(de_dims) == len(de_blocks)+1
-        for i in range(len(en_dims)-1):
-            self.decode_list.append(
-                PointNetFeaturePropagation(de_dims[i]+en_dims[i+1], de_dims[i+1],
-                                           blocks=de_blocks[i], groups=groups, res_expansion=res_expansion,
-                                           bias=bias, activation=activation)
+        de_dims.insert(0, en_dims[0])
+        self.decoder_list = nn.ModuleList()
+        for i in range(len(de_blocks)):
+            in_channel = last_channel + en_dims[i + 1]
+            out_channel = de_dims[i + 1]
+
+            # TODO DistInterpolator outside?
+            self.decoder_list.append(
+                Decoder(in_channel, out_channel,
+                        blocks=de_blocks[i], groups=groups, res_expansion=res_expansion,
+                        bias=bias, activation=activation)
             )
 
-        self.act = get_activation(activation)
+            last_channel = out_channel
 
-        # class label mapping
+        # Class label mapping
         self.cls_map = nn.Sequential(
             ConvBNReLU1D(16, cls_dim, bias=bias, activation=activation),
             ConvBNReLU1D(cls_dim, cls_dim, bias=bias, activation=activation)
         )
-        # global max pooling mapping
+
+        # Global max pooling mapping
         self.gmp_map_list = nn.ModuleList()
         for en_dim in en_dims:
             self.gmp_map_list.append(ConvBNReLU1D(en_dim, gmp_dim, bias=bias, activation=activation))
         self.gmp_map_end = ConvBNReLU1D(gmp_dim*len(en_dims), gmp_dim, bias=bias, activation=activation)
 
-        # classifier
+        # Classifier
         self.classifier = nn.Sequential(
             nn.Conv1d(gmp_dim+cls_dim+de_dims[-1], 128, 1, bias=bias),
             nn.BatchNorm1d(128),
             nn.Dropout(),
-            nn.Conv1d(128, num_classes, 1, bias=bias)
+            nn.Conv1d(128, class_num, 1, bias=bias)
         )
 
     def forward(self, x, norm_plt, cls_label):
@@ -443,18 +504,8 @@ class PointMLP(nn.Module):
         x_list, xyz_list = [x], [xyz]
 
         # Run encoder
-        for i in range(self.stages):
-            # input:  xyz[batch, point, 3], feat[batch, point, dim]
-            # output: xyz[batch, sample, 3], feat[batch, sample, neighbor, dim * 2 (+ 3)]
-            xyz, x = self.local_grouper_list[i](xyz, x.permute(0, 2, 1))
-            
-            # input:  feat[batch, sample, neighbor, dim * 2 (+ 3)]
-            # output: feat[batch, dim * 2, sample]
-            x = self.pre_blocks_list[i](x)
-            
-            # input:  feat[batch, dim * 2, sample]
-            # output: feat[batch, dim * 2, sample]
-            x = self.pos_blocks_list[i](x)
+        for i in range(len(self.encoder_list)):
+            xyz, x = self.encoder_list[i](xyz, x)
             
             # store output
             xyz_list.append(xyz)
@@ -465,9 +516,10 @@ class PointMLP(nn.Module):
         x_list.reverse()
 
         # Run decoder
-        for i in range(len(self.decode_list)):
-            x = self.decode_list[i](xyz_list[i+1], xyz_list[i], x_list[i+1], x)
+        for i in range(len(self.decoder_list)):
+            x = self.decoder_list[i](xyz_list[i+1], xyz_list[i], x_list[i+1], x)
 
+        # TODO to modify here
         # here is the global context
         gmp_list = []
         for i in range(len(x_list)):
@@ -483,11 +535,11 @@ class PointMLP(nn.Module):
         return x
 
 
-def pointMLP(num_classes=50, **kwargs) -> PointMLP:
-    return PointMLP(num_classes=num_classes, points=2048, embed_dim=64, groups=1, res_expansion=1.0,
+def pointMLP(class_num=50, **kwargs) -> PointMLP:
+    return PointMLP(class_num=class_num, point_num=2048, embed_dim=64, groups=1, res_expansion=1.0,
                  activation="relu", bias=True, use_xyz=True, normalize="anchor",
                  dim_expansion=[2, 2, 2, 2], pre_blocks=[2, 2, 2, 2], pos_blocks=[2, 2, 2, 2],
-                 k_neighbors=[32, 32, 32, 32], reducers=[4, 4, 4, 4],
+                 neighbor_nums=[32, 32, 32, 32], reducers=[4, 4, 4, 4], sample_nums=[512, 128, 32, 8],
                  de_dims=[512, 256, 128, 128], de_blocks=[4, 4, 4, 4],
                  gmp_dim=64,cls_dim=64, **kwargs)
 
